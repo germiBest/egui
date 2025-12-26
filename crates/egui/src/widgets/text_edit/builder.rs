@@ -59,6 +59,16 @@ type LayouterFn<'t> = &'t mut dyn FnMut(&Ui, &dyn TextBuffer, f32) -> Arc<Galley
 /// }
 /// ```
 ///
+/// Alternatively, you can use the [`readonly`](Self::readonly) method to make a mutable text field read-only:
+///
+/// ```
+/// # egui::__run_test_ui(|ui| {
+/// # let mut my_string = String::from("Hello, world!");
+/// // Text can be selected and copied, but not edited:
+/// ui.add(egui::TextEdit::singleline(&mut my_string).readonly(true));
+/// # });
+/// ```
+///
 /// ## Advanced usage
 /// See [`TextEdit::show`].
 ///
@@ -89,6 +99,7 @@ pub struct TextEdit<'t> {
     char_limit: usize,
     return_key: Option<KeyboardShortcut>,
     background_color: Option<Color32>,
+    readonly: bool,
 }
 
 impl WidgetWithState for TextEdit<'_> {
@@ -148,6 +159,7 @@ impl<'t> TextEdit<'t> {
             char_limit: usize::MAX,
             return_key: Some(KeyboardShortcut::new(Modifiers::NONE, Key::Enter)),
             background_color: None,
+            readonly: false,
         }
     }
 
@@ -287,6 +299,24 @@ impl<'t> TextEdit<'t> {
     #[inline]
     pub fn interactive(mut self, interactive: bool) -> Self {
         self.interactive = interactive;
+        self
+    }
+
+    /// When `false` (default), the text can be edited.
+    ///
+    /// When `true`, the text is read-only:
+    /// - Text can be selected and copied
+    /// - Cursor can be moved with keyboard/mouse
+    /// - Text cannot be edited or modified
+    /// - No blinking cursor in edit position
+    ///
+    /// This is different from [`interactive(false)`](Self::interactive), which
+    /// disables all interaction (both selection and editing).
+    ///
+    /// For a completely disabled text edit, use [`Ui::add_enabled`] instead.
+    #[inline]
+    pub fn readonly(mut self, readonly: bool) -> Self {
+        self.readonly = readonly;
         self
     }
 
@@ -493,6 +523,7 @@ impl TextEdit<'_> {
             char_limit,
             return_key,
             background_color: _,
+            readonly,
         } = self;
 
         let text_color = text_color
@@ -609,7 +640,7 @@ impl TextEdit<'_> {
             }
         }
 
-        if interactive && response.hovered() {
+        if (interactive || readonly) && response.hovered() {
             ui.set_cursor_icon(CursorIcon::Text);
         }
 
@@ -638,6 +669,7 @@ impl TextEdit<'_> {
                 char_limit,
                 event_filter,
                 return_key,
+                readonly,
             );
 
             if changed {
@@ -770,7 +802,7 @@ impl TextEdit<'_> {
                     ui.scroll_to_rect(primary_cursor_rect + margin, None);
                 }
 
-                if text.is_mutable() && interactive {
+                if text.is_mutable() && interactive && !readonly {
                     let now = ui.input(|i| i.time);
                     if response.changed() || selection_changed {
                         state.last_interaction_time = now;
@@ -910,6 +942,7 @@ fn events(
     char_limit: usize,
     event_filter: EventFilter,
     return_key: Option<KeyboardShortcut>,
+    readonly: bool,
 ) -> (bool, CCursorRange) {
     let os = ui.ctx().os();
 
@@ -938,6 +971,11 @@ fn events(
         events.sort_by_key(|e| !matches!(e, Event::Ime(_)));
     }
 
+    // Remove all IME events in readonly mode
+    if readonly {
+        events.retain(|e| !matches!(e, Event::Ime(_)));
+    }
+
     for event in &events {
         let did_mutate_text = match event {
             // First handle events that only changes the selection cursor, not the text:
@@ -950,7 +988,9 @@ fn events(
                 None
             }
             Event::Cut => {
-                if cursor_range.is_empty() {
+                if readonly {
+                    None
+                } else if cursor_range.is_empty() {
                     None
                 } else {
                     copy_if_not_password(ui, cursor_range.slice_str(text.as_str()).to_owned());
@@ -958,7 +998,9 @@ fn events(
                 }
             }
             Event::Paste(text_to_insert) => {
-                if !text_to_insert.is_empty() {
+                if readonly {
+                    None
+                } else if !text_to_insert.is_empty() {
                     let mut ccursor = text.delete_selected(&cursor_range);
                     if multiline {
                         text.insert_text_at(&mut ccursor, text_to_insert, char_limit);
@@ -974,7 +1016,9 @@ fn events(
             }
             Event::Text(text_to_insert) => {
                 // Newlines are handled by `Key::Enter`.
-                if !text_to_insert.is_empty() && text_to_insert != "\n" && text_to_insert != "\r" {
+                if readonly {
+                    None
+                } else if !text_to_insert.is_empty() && text_to_insert != "\n" && text_to_insert != "\r" {
                     let mut ccursor = text.delete_selected(&cursor_range);
 
                     text.insert_text_at(&mut ccursor, text_to_insert, char_limit);
@@ -990,7 +1034,10 @@ fn events(
                 modifiers,
                 ..
             } if multiline => {
-                let mut ccursor = text.delete_selected(&cursor_range);
+                if readonly {
+                    None
+                } else {
+                    let mut ccursor = text.delete_selected(&cursor_range);
                 if modifiers.shift {
                     // TODO(emilk): support removing indentation over a selection?
                     text.decrease_indentation(&mut ccursor);
@@ -998,6 +1045,7 @@ fn events(
                     text.insert_text_at(&mut ccursor, "\t", char_limit);
                 }
                 Some(CCursorRange::one(ccursor))
+                }
             }
             Event::Key {
                 key,
@@ -1008,7 +1056,9 @@ fn events(
                 *key == return_key.logical_key && modifiers.matches_logically(return_key.modifiers)
             }) =>
             {
-                if multiline {
+                if readonly {
+                    None
+                } else if multiline {
                     let mut ccursor = text.delete_selected(&cursor_range);
                     text.insert_text_at(&mut ccursor, "\n", char_limit);
                     // TODO(emilk): if code editor, auto-indent by same leading tabs, + one if the lines end on an opening bracket
@@ -1028,7 +1078,9 @@ fn events(
                 || (modifiers.matches_logically(Modifiers::SHIFT | Modifiers::COMMAND)
                     && *key == Key::Z) =>
             {
-                if let Some((redo_ccursor_range, redo_txt)) = state
+                if readonly {
+                    None
+                } else if let Some((redo_ccursor_range, redo_txt)) = state
                     .undoer
                     .lock()
                     .redo(&(cursor_range, text.as_str().to_owned()))
@@ -1046,7 +1098,9 @@ fn events(
                 modifiers,
                 ..
             } if modifiers.matches_logically(Modifiers::COMMAND) => {
-                if let Some((undo_ccursor_range, undo_txt)) = state
+                if readonly {
+                    None
+                } else if let Some((undo_ccursor_range, undo_txt)) = state
                     .undoer
                     .lock()
                     .undo(&(cursor_range, text.as_str().to_owned()))
@@ -1063,7 +1117,7 @@ fn events(
                 key,
                 pressed: true,
                 ..
-            } => check_for_mutating_key_press(os, &cursor_range, text, galley, modifiers, *key),
+            } => check_for_mutating_key_press(os, &cursor_range, text, galley, modifiers, *key, readonly),
 
             Event::Ime(ime_event) => match ime_event {
                 ImeEvent::Enabled => {
@@ -1166,7 +1220,12 @@ fn check_for_mutating_key_press(
     galley: &Galley,
     modifiers: &Modifiers,
     key: Key,
+    readonly: bool,
 ) -> Option<CCursorRange> {
+    if readonly {
+        return None;
+    }
+
     match key {
         Key::Backspace => {
             let ccursor = if modifiers.mac_cmd {
